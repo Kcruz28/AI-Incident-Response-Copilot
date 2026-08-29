@@ -1,11 +1,48 @@
 import json
 import os
+import uuid
 
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel
+from qdrant_client import QdrantClient, models
 
 MODEL_ID = "BAAI/bge-base-en-v1.5"
+COLLECTION_NAME = "incident_chunks"
+
+
+def start_qdrant_client(host="localhost", port=6333):
+    return QdrantClient(host=host, port=port)
+
+
+def stop_qdrant_client(client):
+    client.close()
+
+
+def start_collection(client, collection_name, vector_size):
+    client.recreate_collection(
+        collection_name=collection_name,
+        vectors_config=models.VectorParams(
+            size=vector_size, distance=models.Distance.COSINE
+        ),
+    )
+
+
+def add_embeddings(client, collection_name, records, embeddings):
+    points = [
+        models.PointStruct(
+            id=str(uuid.uuid5(uuid.NAMESPACE_DNS, record["id"])),
+            vector=embedding.tolist(),
+            payload={
+                "chunk_id": record["id"],
+                "source": record["source"],
+                "text": record["text"],
+            },
+        )
+        for record, embedding in zip(records, embeddings)
+    ]
+    client.upsert(collection_name=collection_name, points=points)
+    return points
 
 
 def load_model(model_id=MODEL_ID):
@@ -38,13 +75,6 @@ def embed_texts(texts, tokenizer, model, device, batch_size=32):
     return np.concatenate(all_embeddings, axis=0)
 
 
-def save_embeddings(ids, embeddings, out_dir):
-    os.makedirs(out_dir, exist_ok=True)
-    np.save(os.path.join(out_dir, "embeddings.npy"), embeddings)
-    with open(os.path.join(out_dir, "ids.json"), "w", encoding="utf-8") as f:
-        json.dump(ids, f)
-
-
 if __name__ == "__main__":
     processed_dir = "/Users/laflame/project_aug/AI-Incident-Response-Copilot/data/processed"
     chunks_path = os.path.join(processed_dir, "chunks.jsonl")
@@ -53,5 +83,9 @@ if __name__ == "__main__":
     tokenizer, model, device = load_model()
     embeddings = embed_texts([r["text"] for r in records], tokenizer, model, device)
 
-    save_embeddings([r["id"] for r in records], embeddings, processed_dir)
-    print(f"Embedded {len(records)} chunks -> {embeddings.shape} saved to {processed_dir}")
+    client = start_qdrant_client()
+    start_collection(client, COLLECTION_NAME, vector_size=embeddings.shape[1])
+    add_embeddings(client, COLLECTION_NAME, records, embeddings)
+    stop_qdrant_client(client)
+
+    print(f"Embedded {len(records)} chunks -> {embeddings.shape} and upserted into Qdrant collection '{COLLECTION_NAME}'")
